@@ -1,0 +1,151 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autoservice
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autoservice-billing
+  namespace: autoservice
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/autoservicemanager-ENV-billing-irsa
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-config
+  namespace: autoservice
+data:
+  # Substitua ACCOUNT_ID/ENV pelos outputs do Terraform (infra-db / infra-k8s).
+  # Filas/tópicos reais: ${project}-${env}-billing-commands|events
+  NODE_ENV: production
+  PORT: "3000"
+  AWS_REGION: us-east-1
+  DYNAMODB_TABLE: autoservicemanager-ENV-billing
+  SQS_COMMAND_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/ACCOUNT_ID/autoservicemanager-ENV-billing-commands
+  SNS_EVENTS_TOPIC_ARN: arn:aws:sns:us-east-1:ACCOUNT_ID:autoservicemanager-ENV-billing-events
+  MERCADO_PAGO_BASE_URL: https://api.mercadopago.com
+  WEBHOOK_SIGNATURE_ENABLED: "true"
+  SQS_POLLING_ENABLED: "true"
+  AWS_XRAY_ENABLED: "true"
+  AWS_XRAY_CONTEXT_MISSING: LOG_ERROR
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing
+  namespace: autoservice
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: billing
+  template:
+    metadata:
+      labels:
+        app: billing
+    spec:
+      serviceAccountName: autoservice-billing
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: billing
+          image: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/autoservicemanager-billing:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: billing-config
+          env:
+            - name: MERCADO_PAGO_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: billing-secrets
+                  key: mercado-pago-access-token
+            - name: MERCADO_PAGO_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: billing-secrets
+                  key: mercado-pago-webhook-secret
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing
+  namespace: autoservice
+spec:
+  selector:
+    app: billing
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: billing
+  namespace: autoservice
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: billing
+  minReplicas: 2
+  maxReplicas: 8
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: billing
+  namespace: autoservice
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: billing
