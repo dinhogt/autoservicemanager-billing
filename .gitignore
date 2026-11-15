@@ -9,3 +9,6 @@ coverage/
 .idea/
 .vscode/
 .eslintcache
+
+# specs locais do agente (não faz parte da entrega)
+spec-skills-lib/
